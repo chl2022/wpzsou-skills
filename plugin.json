@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "wpzsou-search",
+  "version": "1.0.0",
+  "description": "实时调用云盘智搜 wpzsou.com 搜索网盘资源，并获取网站转链后的分享地址。",
+  "author": {"name": "wpzsou", "url": "https://wpzsou.com"},
+  "homepage": "https://wpzsou.com",
+  "license": "MIT-0",
+  "keywords": ["agent-skills", "cloud-drive", "search", "Chinese", "wpzsou"]
+}
