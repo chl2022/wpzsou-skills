@@ -18,7 +18,7 @@ export const HELP = {
   usage: 'node scripts/search.mjs --query "关键词" [--provider quark] [--kind movie] [--page 1] [--limit 3] [--timeout 60]',
   singleResource: 'node scripts/search.mjs --resource-id "搜索结果中的 resourceId" [--provider quark]',
   options: { query: '1–120 字符；也可使用一个位置参数', provider: PROVIDERS, kind: KINDS, sort: ['relevance', 'updated_desc'], page: '1–50，默认 1', limit: '最多提交转链的条数，1–10，默认 3', timeout: '每条转链最多等待秒数，5–90，默认 60；全程最多 180 秒', help: '显示此说明' },
-  notes: ['只检索指定页面的前 12 条候选，不自动翻页。', '仅返回本站转链后的非演示链接；直接源链接不返回。', '限流时停止提交，不自动重试 POST。'],
+  notes: ['只检索指定页面的前 12 条候选，不自动翻页。', '返回本站转链结果；仅在网站明确标记新分享不可用时返回原分享，并单独标记 source_fallback。', '关键词搜索按相关性排序；updated_desc 保留参数兼容但不会按更新时间排序。', '每次调用重新取链，不复用历史结果；限流时停止提交，不自动重试 POST。'],
 };
 
 function fail(code, message, retryable = false, extra = {}) {
@@ -132,9 +132,10 @@ function metadata(item) {
   };
 }
 
-function convertedResult(job, item, now) {
+function deliveredResult(job, item, now) {
   const result = job.result;
-  if (!result || result.delivery !== 'converted' || result.isDemo !== false) throw fail('CONVERTED_LINK_REQUIRED', '网站未返回正式转链结果，已拒绝直接源链接和演示结果');
+  const sourceFallback = result?.delivery === 'direct' && result.fallbackReason === 'unusable_converted_share';
+  if (!result || result.delivery !== 'converted' && !sourceFallback || result.isDemo !== false) throw fail('CONVERTED_LINK_REQUIRED', '网站未返回正式转链结果或明确的新分享不可用回退，已拒绝普通源链接和演示结果');
   const provider = job.provider ?? item.provider;
   if (!SHARE_HOSTS[provider] || item.provider && provider !== item.provider) throw fail('INVALID_CONVERTED_LINK', '转链结果的网盘类型不匹配');
   let url;
@@ -143,9 +144,9 @@ function convertedResult(job, item, now) {
   if (result.availableUntil !== undefined && (typeof result.availableUntil !== 'string' || !Number.isFinite(Date.parse(result.availableUntil)) || Date.parse(result.availableUntil) <= now)) throw fail('CONVERTED_LINK_EXPIRED', '转链结果已过期，请重新获取', true);
   if (result.code !== undefined && (typeof result.code !== 'string' || !/^[a-zA-Z0-9_-]{1,32}$/.test(result.code))) throw fail('INVALID_CONVERTED_LINK', '转链结果提取码格式无效');
   return {
-    ...metadata(item), provider, status: 'converted', shareUrl: url.href,
+    ...metadata(item), provider, status: sourceFallback ? 'source_fallback' : 'converted', shareUrl: url.href,
     ...(result.code ? { accessCode: result.code } : {}),
-    ...(result.availableUntil !== undefined ? { availableUntil: result.availableUntil } : {}),
+    ...(sourceFallback ? { fallbackReason: 'unusable_converted_share' } : result.availableUntil !== undefined ? { availableUntil: result.availableUntil } : {}),
     cacheHit: result.cacheHit === true,
   };
 }
@@ -161,7 +162,7 @@ export async function runSearch(input, dependencies = {}) {
   const output = {
     schemaVersion: 1, service: 'wpzsou', status: 'failed', source: options.resourceId ? 'transfer' : 'remote',
     page: options.resourceId ? null : options.page, hasNextPage: false, maxReachablePage: null,
-    requestedLimit: options.limit, scannedCandidates: 0, transferAttempts: 0, convertedCount: 0,
+    requestedLimit: options.limit, scannedCandidates: 0, transferAttempts: 0, convertedCount: 0, fallbackCount: 0,
     results: [], warnings: [], checkedAt: new Date(startedAt).toISOString(),
   };
 
@@ -174,7 +175,7 @@ export async function runSearch(input, dependencies = {}) {
     try {
       return await Promise.race([
         (async () => {
-          const response = await fetcher(`${SITE}${path}`, { ...init, headers: { Accept: 'application/json', ...init.headers }, redirect: 'error', credentials: 'omit', signal: controller.signal });
+          const response = await fetcher(`${SITE}${path}`, { ...init, headers: { Accept: 'application/json', 'Cache-Control': 'no-store', ...init.headers }, cache: 'no-store', redirect: 'error', credentials: 'omit', signal: controller.signal });
           if (response.url && new URL(response.url).origin !== SITE) throw fail('INVALID_RESPONSE_ORIGIN', '响应来源与本站不一致');
           if (response.status === 429) {
             await response.body?.cancel().catch(() => {});
@@ -204,7 +205,8 @@ export async function runSearch(input, dependencies = {}) {
     let candidates;
     if (options.resourceId) candidates = [{ id: options.resourceId, ...(options.provider ? { provider: options.provider } : {}) }];
     else {
-      const params = new URLSearchParams({ q: options.query, sort: options.sort, page: String(options.page) });
+      const params = new URLSearchParams({ q: options.query, sort: 'relevance', page: String(options.page) });
+      if (options.sort === 'updated_desc') output.warnings.push('网站当前关键词搜索按相关性排序；updated_desc 未应用，已使用 relevance。');
       if (options.provider) params.set('provider', options.provider);
       if (options.kind) params.set('kind', options.kind);
       const data = await request(`/api/search?${params}`);
@@ -215,7 +217,6 @@ export async function runSearch(input, dependencies = {}) {
       output.maxReachablePage = data.maxReachablePage;
       if (options.provider && data.capabilities?.providerFilter === false) output.warnings.push('网站当前不支持网盘筛选；客户端仅处理与指定网盘一致的候选，无匹配时返回空结果。');
       if (options.kind && data.capabilities?.kindFilter === false) output.warnings.push('网站当前不支持资源类型筛选；此类型条件可能未生效，请结合返回的资源类型判断。');
-      if (options.sort === 'updated_desc' && data.capabilities?.updatedSort === false) output.warnings.push('网站当前不支持按更新时间排序；返回顺序可能不是更新时间顺序。');
       const pageCandidates = data.items.slice(0, 12);
       output.scannedCandidates = pageCandidates.length;
       const seen = new Set();
@@ -244,7 +245,13 @@ export async function runSearch(input, dependencies = {}) {
         if (!JOB_ID.test(jobId ?? '')) throw fail('INVALID_TRANSFER_RESPONSE', '网站返回了无效的转链任务标识');
         while (true) {
           if (job.jobId !== jobId) throw fail('INVALID_TRANSFER_RESPONSE', '转链任务标识发生变化');
-          if (job.status === 'succeeded') { output.results.push(convertedResult(job, item, now())); output.convertedCount++; break; }
+          if (job.status === 'succeeded') {
+            const delivered = deliveredResult(job, item, now());
+            output.results.push(delivered);
+            if (delivered.status === 'source_fallback') output.fallbackCount++;
+            else output.convertedCount++;
+            break;
+          }
           if (job.status === 'failed') { const error = publicError(job.error); throw fail(error.code, error.message, error.retryable, { retryAfterSeconds: error.retryAfterSeconds }); }
           if (!PENDING.has(job.status)) throw fail('INVALID_TRANSFER_RESPONSE', '网站返回了未知的转链任务状态');
           const remaining = Math.min(deadline, taskDeadline) - now();
@@ -259,7 +266,8 @@ export async function runSearch(input, dependencies = {}) {
         else if (now() >= deadline) stopError = fail('TOTAL_TIMEOUT', '已达到全程 180 秒限制，已停止后续提交', true);
       }
     }
-    output.status = output.convertedCount === output.results.length ? 'success' : output.convertedCount ? 'partial' : 'failed';
+    const deliveredCount = output.convertedCount + output.fallbackCount;
+    output.status = deliveredCount === output.results.length ? 'success' : deliveredCount ? 'partial' : 'failed';
     return output;
   } catch (error) {
     output.error = publicError(error);

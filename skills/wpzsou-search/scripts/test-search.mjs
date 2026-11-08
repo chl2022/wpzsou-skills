@@ -25,6 +25,8 @@ function fake(responses) {
         assert.equal(new URL(url).origin, 'https://wpzsou.com');
         assert.equal(init.redirect, 'error');
         assert.equal(init.credentials, 'omit');
+        assert.equal(init.cache, 'no-store');
+        assert.equal(init.headers['Cache-Control'], 'no-store');
         assert.ok(!Object.keys(init.headers).some((key) => ['authorization', 'cookie', 'origin'].includes(key.toLowerCase())));
         const next = responses.shift();
         assert.ok(next, 'Unexpected request');
@@ -41,7 +43,7 @@ await check('成功搜索使用 id 转链，白名单输出，忽略跨域 pollU
   const client = fake([
     json(search([item(1, { title: `标题 ${rawLink} 提取码：secret`, description: `介绍 pan.quark.cn/s/source 私密 pwd=1234`, shareUrl: rawLink, accessCode: 'raw', telemetryToken: 'private' })])),
     json({ jobId: ID, status: 'queued', pollUrl: 'https://database.invalid/api/private', telemetryToken: 'private' }, 202),
-    json(completed()),
+    json(completed({ accountId: 'private-account', accountName: 'private-account-name', accountEpoch: 'private-epoch' })),
   ]);
   const output = await runSearch({ query: '电影' }, client.dependencies);
   assert.equal(output.status, 'success');
@@ -53,7 +55,51 @@ await check('成功搜索使用 id 转链，白名单输出，忽略跨域 pollU
   assert.equal(client.calls[1].init.headers['Content-Type'], 'application/json');
   assert.equal(client.calls[2].url, `https://wpzsou.com/api/transfers/${ID}`);
   const text = JSON.stringify(output);
-  for (const secret of ['raw-secret', 'secret', '/s/source', '1234', 'telemetryToken', 'private', 'database.invalid']) assert.ok(!text.includes(secret), secret);
+  for (const secret of ['raw-secret', 'secret', '/s/source', '1234', 'telemetryToken', 'private', 'database.invalid', 'accountId', 'accountName', 'accountEpoch']) assert.ok(!text.includes(secret), secret);
+});
+
+await check('明确的新分享不可用回退返回原分享，独立计数且不套用转链清理期限', async () => {
+  const client = fake([json(completed({ result: result({ delivery: 'direct', fallbackReason: 'unusable_converted_share', url: 'https://pan.quark.cn/s/original', availableUntil: undefined }) }), 202)]);
+  const output = await runSearch({ resourceId: 'es.item_1', provider: 'quark' }, client.dependencies);
+  assert.equal(output.status, 'success');
+  assert.equal(output.convertedCount, 0);
+  assert.equal(output.fallbackCount, 1);
+  assert.equal(output.results[0].status, 'source_fallback');
+  assert.equal(output.results[0].fallbackReason, 'unusable_converted_share');
+  assert.equal(output.results[0].shareUrl, 'https://pan.quark.cn/s/original');
+  assert.equal(output.results[0].accessCode, 'abcd');
+  assert.ok(!('availableUntil' in output.results[0]));
+  assert.equal(client.calls.length, 1);
+});
+
+await check('转链、明确回退和失败混合时统计不把原分享计为转链', async () => {
+  const client = fake([
+    json(search([item(1), item(2), item(3)])), json(completed(), 202),
+    json(completed({ result: result({ delivery: 'direct', fallbackReason: 'unusable_converted_share', availableUntil: undefined }) }), 202),
+    json({ jobId: ID, status: 'failed', error: { code: 'TRANSFER_SOURCE_INVALID', message: '原分享失效' } }, 202),
+  ]);
+  const output = await runSearch({ query: '片名' }, client.dependencies);
+  assert.equal(output.status, 'partial');
+  assert.equal(output.convertedCount, 1);
+  assert.equal(output.fallbackCount, 1);
+  assert.deepEqual(output.results.map((row) => row.status), ['converted', 'source_fallback', 'failed']);
+  assert.equal(output.transferAttempts, 3);
+});
+
+await check('回退仍拒绝未知原因、演示、错误网盘、非 HTTPS 和伪造域名', async () => {
+  for (const override of [
+    { fallbackReason: 'unknown' }, { fallbackReason: undefined }, { isDemo: true }, { isDemo: undefined },
+    { url: 'https://pan.baidu.com/s/rejected' }, { url: 'http://pan.quark.cn/s/rejected' },
+    { url: 'https://pan.quark.cn.evil.invalid/s/rejected' }, { url: 'https://secret:password@pan.quark.cn/s/rejected' },
+  ]) {
+    const client = fake([json(completed({ result: result({ delivery: 'direct', fallbackReason: 'unusable_converted_share', availableUntil: undefined, ...override }) }), 202)]);
+    const output = await runSearch({ resourceId: 'es.item_1', provider: 'quark' }, client.dependencies);
+    assert.equal(output.status, 'failed');
+    assert.equal(output.fallbackCount, 0);
+    assert.equal(output.convertedCount, 0);
+    assert.ok(!('shareUrl' in output.results[0]));
+    assert.ok(!JSON.stringify(output).includes('/s/rejected'));
+  }
 });
 
 await check('每页只检查前 12 条，最多 limit 次提交，失败不扩充', async () => {
@@ -143,7 +189,7 @@ await check('网站筛选能力不足时警告，指定网盘绝不返回其它�
   assert.equal(output.warnings.length, 4);
   assert.ok(output.warnings.some((message) => message.includes('网盘筛选')));
   assert.ok(output.warnings.some((message) => message.includes('资源类型筛选')));
-  assert.ok(output.warnings.some((message) => message.includes('按更新时间排序')));
+  assert.ok(output.warnings.some((message) => message.includes('updated_desc 未应用')));
   assert.equal(client.calls.length, 1);
 });
 
@@ -212,6 +258,8 @@ await check('参数验证与可达页信息，无自动翻页', async () => {
   assert.equal(params.get('page'), '2');
   assert.equal(params.get('provider'), 'quark');
   assert.equal(params.get('kind'), 'movie');
+  assert.equal(params.get('sort'), 'relevance');
+  assert.ok(output.warnings.some((message) => message.includes('updated_desc 未应用')));
   assert.equal(output.hasNextPage, true);
   assert.equal(output.maxReachablePage, 8);
   assert.equal(client.calls.length, 1);
