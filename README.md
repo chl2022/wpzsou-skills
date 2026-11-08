@@ -1,10 +1,10 @@
 # 云盘智搜 Agent Skill · wpzsou-search
 
-让支持 Agent Skills 的 AI **实时调用 [云盘智搜](https://wpzsou.com) 搜索网盘资源，并返回网站转链后的分享地址**。
+让支持 Agent Skills 的 AI **实时调用 [云盘智搜](https://wpzsou.com) 搜索网盘资源，并获取网站交付的分享地址**。
 
 这个仓库只发布技能说明与零依赖客户端脚本。网站源码、数据库实现、服务器配置、API 密钥及网盘账号均不在公开仓库中。客户端仅调用 wpzsou.com 的公开搜索和转链接口。
 
-English: An Agent Skill for live Chinese cloud-drive resource search through wpzsou.com. Returns website-converted share links only. No website source code, database access, API keys, or drive-account credentials are included.
+English: An Agent Skill for live Chinese cloud-drive resource search through wpzsou.com. Returns converted share links, or a clearly labeled original-share fallback only when the website explicitly reports an unusable converted share. No website source code, database access, API keys, or drive-account credentials are included.
 
 GitHub 主仓库：[chl2022/wpzsou-skills](https://github.com/chl2022/wpzsou-skills)。
 
@@ -18,13 +18,15 @@ node skills/wpzsou-search/scripts/search.mjs --query "恐怖星球" --provider q
 node skills/wpzsou-search/scripts/search.mjs --help
 ```
 
-默认最多请求 3 条资源的转链。返回 JSON，成功项含作品名、网盘、`shareUrl`、可选 `accessCode`、`availableUntil` 以及网站详情地址。链接失效后需要重新获取；程序不会用原始资源链接替代转链失败的结果。
+默认最多请求 3 条资源的转链。返回 JSON，交付项含作品名、网盘、`shareUrl`、可选 `accessCode`、`availableUntil` 以及网站详情地址。`converted` 表示完成转链；1.1.0 新增 `source_fallback`，仅在网站明确确认新分享不可用并返回原分享时交付，且不保证原分享有效。无明确回退原因的直链和演示结果仍会拒绝。
+
+每次调用独立提交转链，使用 `no-store`，不复用历史任务或缓存结果，也不自动重试 POST。转换链接展示实际 `availableUntil`，过期后重新获取；回退原分享不人为设置 5 分钟期限。
 
 对 AI 可以说：
 
-> 使用 wpzsou-search 帮我找 Python 入门教程，优先夸克网盘，返回 3 条转链后的分享地址、提取码和有效时间。
+> 使用 wpzsou-search 帮我找 Python 入门教程，优先夸克网盘，返回 3 条分享地址、提取码和有效时间；若网站回退原分享，请明确标注。
 
-搜索的是网站当前资源库，并非每次查询都重新采集 TG 或全网。搜索、转链受网站限流、网盘状态及资源有效性影响；接口故障与“无匹配结果”会分别报告。
+搜索的是网站当前资源库，并非每次查询都重新采集 TG 或全网。关键词搜索按相关性排序；`--sort updated_desc` 保留兼容，但会降为 `relevance` 并给出警告。搜索、转链受网站限流、网盘状态及资源有效性影响；接口故障与“无匹配结果”会分别报告。
 
 ## 安装到 AI 工具
 
@@ -68,7 +70,7 @@ Windows 用户可以将技能目录复制到对应用户目录中的 `.agents/sk
 node skills/wpzsou-search/scripts/test-search.mjs
 ```
 
-测试使用模拟公开接口，验证转链输出、失败处理、限流、时间预算和原始链接保护，不连接网站数据库。
+测试使用模拟公开接口，验证转链与明确回退输出、失败处理、限流、时间预算和输出字段边界，不连接网站数据库。
 
 ## 许可边界
 
